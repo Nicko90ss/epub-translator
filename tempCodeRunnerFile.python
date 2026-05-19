@@ -1,0 +1,212 @@
+#Got it. You want the code presented as clean, standard text exactly as it would look in your VS Code editor, without the Markdown code block containers.
+
+### requirements.txt
+
+
+
+### epub.py
+
+import os
+import time
+from ebooklib import epub, ITEM_DOCUMENT
+from bs4 import BeautifulSoup
+import pdfplumber
+from deep_translator import GoogleTranslator
+from langdetect import detect
+from fpdf import FPDF
+
+def extract_epub(file_path):
+    book = epub.read_epub(file_path)
+    texts = []
+    for item in book.get_items():
+        if item.get_type() == ITEM_DOCUMENT:
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            texts.append(soup.get_text())
+    return "\n".join(texts)
+
+def extract_pdf(file_path):
+    text = ""
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+    return text
+
+def split_text(text, max_length):
+    words = text.split()
+    chunks = []
+    current = ""
+    for word in words:
+        if len(current) + len(word) + 1 < max_length:
+            current += " " + word
+        else:
+            chunks.append(current)
+            current = word
+    if current:
+        chunks.append(current)
+    return chunks
+
+def translate_large_text(text, target="en", job_id=None, jobs=None):
+    chunks = split_text(text, 1500)
+    translated_chunks = []
+    total = len(chunks)
+
+    if job_id and jobs:
+        jobs[job_id]['total'] = total
+
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        if job_id and jobs:
+            jobs[job_id]['progress'] = i + 1
+
+        retry_count = 0
+        while retry_count < 3:
+            try:
+                print(f"Translating chunk {i+1} of {total}...")
+                translated = GoogleTranslator(source='auto', target=target).translate(chunk)
+                translated_chunks.append(translated)
+                time.sleep(2)
+                break
+            except Exception as e:
+                retry_count += 1
+                print(f"Retrying chunk {i+1}... ({retry_count}/3)")
+                time.sleep(5)
+
+        if retry_count == 3:
+            translated_chunks.append("[TRANSLATION ERROR]")
+
+    return "\n".join(translated_chunks)
+
+def save_as_pdf(text, output_path):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    
+    # Standard PDF fonts require latin-1 encoding
+    safe_text = text.encode('latin-1', 'replace').decode('latin-1')
+    
+    for line in safe_text.split('\n'):
+        pdf.multi_cell(0, 10, txt=line)
+    try:
+       pdf.output(output_path)
+    except Exception as e:
+       print("PDF SAVE FAILED:", e)
+    
+
+def process_file_to_text(file_path, job_id=None, jobs=None):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".epub":
+        text = extract_epub(file_path)
+    elif ext == ".pdf":
+        text = extract_pdf(file_path)
+    else:
+        return None
+    if not text.strip():
+        return None
+    try:
+        lang = detect(text[:2000])
+        if job_id and jobs:
+            jobs[job_id]['lang'] = lang
+    except:
+        pass
+    return translate_large_text(text, job_id=job_id, jobs=jobs)
+
+def process_file(file_input):
+    clean_path = file_input.strip().replace('"', '').replace("'", "")
+    if not os.path.exists(clean_path):
+        return
+    result = process_file_to_text(clean_path)
+    if result:
+        save_as_pdf(result, "translated_output.pdf")
+
+if __name__ == "__main__":
+    path_input = input("Enter file path: ")
+    process_file(path_input)
+
+
+
+### app.py
+
+import os
+import uuid
+import threading
+from flask import Flask, request, send_file, render_template, jsonify
+from werkzeug.utils import secure_filename
+from epub import process_file_to_text, save_as_pdf
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'uploads')
+app.config['OUTPUT_FOLDER'] = os.path.join(os.getcwd(), 'outputs')
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+
+jobs = {}
+ALLOWED_EXTENSIONS = {'epub', 'pdf'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def run_translation(job_id, input_path, output_path):
+    try:
+        jobs[job_id]['status'] = 'translating'
+        text = process_file_to_text(input_path, job_id, jobs)
+        if text:
+            save_as_pdf(text, output_path)
+            jobs[job_id]['status'] = 'done'
+        else:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['error'] = 'No text extracted'
+    except Exception as e:
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['error'] = str(e)
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/translate', methods=['POST'])
+def translate():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    file = request.files['file']
+    if not file.filename or not allowed_file(file.filename):
+        return jsonify({'error': 'Unsupported file type'}), 400
+
+    filename = secure_filename(file.filename)
+    job_id = str(uuid.uuid4())[:8]
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_{filename}")
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f"{job_id}_translated.pdf")
+
+    file.save(input_path)
+    jobs[job_id] = {'status': 'queued', 'progress': 0, 'total': 0, 'filename': filename}
+
+    thread = threading.Thread(target=run_translation, args=(job_id, input_path, output_path))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({'job_id': job_id})
+
+@app.route('/status/<job_id>')
+def status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify(job)
+
+@app.route('/download/<job_id>')
+def download(job_id):
+    job = jobs.get(job_id)
+    if not job or job['status'] != 'done':
+        return jsonify({'error': 'Not ready'}), 400
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], f"{job_id}_translated.pdf")
+    original_name = os.path.splitext(job['filename'])[0]
+    return send_file(output_path, as_attachment=True, download_name=f"{original_name}_translated.pdf")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
